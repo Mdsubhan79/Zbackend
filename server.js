@@ -3,18 +3,36 @@ const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
 const cors = require("cors");
+const fileUpload = require("express-fileupload");
+const http = require("http");
+const { Server } = require("socket.io");
 require("dotenv").config();
+
+const Message = require("./models/Message");
+const { encrypt } = require("./utils/crypto");
+const cloudinary = require("cloudinary").v2;
+const uploadRoute = require("./routes/upload");
+
 const app = express();
 app.use(express.json());
 app.use(cors());
-
-
+app.use(fileUpload({ useTempFiles: true }));
+app.use("/upload", uploadRoute);
+// --- ENV ---
 const MONGO_URI = process.env.MONGO_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// --- DB ---
 mongoose.connect(MONGO_URI)
   .then(() => console.log("MongoDB Connected ✅"))
   .catch(err => console.log("Mongo Error:", err));
+
+// --- Cloudinary ---
+cloudinary.config({
+  cloud_name: process.env.CLOUD_NAME,
+  api_key: process.env.API_KEY,
+  api_secret: process.env.API_SECRET,
+});
 
 // --- User Model ---
 const User = mongoose.model("User", {
@@ -44,7 +62,7 @@ app.post("/signup", async (req, res) => {
     await user.save();
 
     res.json({ message: "Signup successful ✅" });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -68,34 +86,86 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// JWT TOKEN
-
+// /me
 app.get("/me", async (req, res) => {
   try {
     const token = req.headers.authorization;
-
-    if (!token) {
-      return res.status(401).json({ error: "No token" });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
+    const decoded = jwt.verify(token, JWT_SECRET);
     const user = await User.findById(decoded.id);
-
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
 
     res.json({
       name: user.name,
       phone: user.phone,
     });
-
-  } catch (err) {
-    console.log("ME ERROR:", err);
+  } catch {
     res.status(401).json({ error: "Invalid token" });
   }
 });
-app.listen(5000, () => {
+
+
+// --- SERVER ---
+const server = http.createServer(app);
+
+// --- SOCKET ---
+const io = new Server(server, {
+  cors: { origin: "*" },
+});
+
+// 🔐 AUTH
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+    const decoded = jwt.verify(token, JWT_SECRET);
+    socket.user = decoded;
+    next();
+  } catch {
+    next(new Error("Unauthorized"));
+  }
+});
+
+// 🔌 CONNECTION
+io.on("connection", (socket) => {
+  const userId = socket.user.id;
+  console.log("Connected:", userId);
+
+  socket.join(userId);
+
+  // 💬 CHAT
+  socket.on("sendMessage", async ({ receiver, message, type }) => {
+    const encrypted = encrypt(message);
+
+    const msg = await Message.create({
+      sender: userId,
+      receiver,
+      message: encrypted,
+      type,
+    });
+
+    io.to(receiver).emit("receiveMessage", msg);
+  });
+
+  // 📞 CALL
+  socket.on("callUser", ({ to, offer }) => {
+    io.to(to).emit("incomingCall", {
+      from: userId,
+      offer,
+    });
+  });
+
+  socket.on("answerCall", ({ to, answer }) => {
+    io.to(to).emit("callAnswered", { answer });
+  });
+
+  socket.on("iceCandidate", ({ to, candidate }) => {
+    io.to(to).emit("iceCandidate", { candidate });
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Disconnected:", userId);
+  });
+});
+
+// --- START ---
+server.listen(5000, () => {
   console.log("Server running on port 5000 🚀");
 });
